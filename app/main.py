@@ -418,10 +418,10 @@ def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
     """
     seeds = [
         {
-            "id": "seed_summit2026_public",
+            "id": "seed_southsummit26_public",
             "plain_code": "SOUTHSUMMIT26",
-            "label": "Participante Summit",
-            "source": "invite",
+            "label": "South Summit User",
+            "source": "summit_user",
             "max_uses": 5000,
             "expires_days": 30,
             "created_by": "system_seed",
@@ -429,8 +429,8 @@ def _seed_default_summit_codes(db: Session, org: str = "public") -> None:
         {
             "id": "seed_efata777_public",
             "plain_code": "EFATA777",
-            "label": "Investidor",
-            "source": "invite",
+            "label": "Investor",
+            "source": "investor",
             "max_uses": 200,
             "expires_days": 90,
             "created_by": "system_seed",
@@ -626,6 +626,79 @@ Typical response length: 2–4 short paragraphs or a structured technical analys
         voice_id="echo",
         is_default=False,
     )
+
+
+
+def bootstrap_system(db: Session, org: Optional[str] = None) -> None:
+    """Best-effort startup bootstrap for empty environments.
+    - Promotes/creates initial admin from ADMIN_EMAILS
+    - Ensures core agents exist for the default org
+    """
+    org = (org or default_tenant() or "patroai").strip() or "patroai"
+
+    # Ensure core agents
+    try:
+        ensure_core_agents(db, org)
+    except Exception:
+        logger.exception("BOOTSTRAP_ENSURE_CORE_AGENTS_FAILED org=%s", org)
+        try:
+            db.rollback()
+        except Exception:
+            pass
+
+    # Ensure first admin exists
+    try:
+        existing_admin = db.execute(
+            select(User).where(User.org_slug == org, User.role == "admin")
+        ).scalar_one_or_none()
+
+        if existing_admin:
+            changed = _ensure_admin_user_state(existing_admin)
+            if changed:
+                db.add(existing_admin)
+                db.commit()
+            return
+
+        emails = admin_emails()
+        if not emails:
+            return
+
+        email = emails[0].strip().lower()
+        existing_user = db.execute(
+            select(User).where(User.org_slug == org, User.email == email)
+        ).scalar_one_or_none()
+
+        if existing_user:
+            existing_user.role = "admin"
+            if getattr(existing_user, "approved_at", None) is None:
+                existing_user.approved_at = now_ts()
+            db.add(existing_user)
+            db.commit()
+            return
+
+        salt = new_salt()
+        pw_hash = pbkdf2_hash(os.getenv("BOOTSTRAP_ADMIN_PASSWORD", "admin123"), salt)
+
+        u = User(
+            id=new_id(),
+            org_slug=org,
+            email=email,
+            name="Super Admin",
+            role="admin",
+            salt=salt,
+            pw_hash=pw_hash,
+            created_at=now_ts(),
+            approved_at=now_ts(),
+            usage_tier="summit_vip" if SUMMIT_MODE else "standard",
+        )
+        db.add(u)
+        db.commit()
+    except Exception:
+        logger.exception("BOOTSTRAP_ADMIN_FAILED org=%s", org)
+        try:
+            db.rollback()
+        except Exception:
+            pass
 
 class RegisterIn(BaseModel):
     tenant: str = Field(default_tenant(), min_length=1)
@@ -1333,10 +1406,21 @@ def _startup():
                 db.close()
         _run_with_timeout(_do_seed_summit_codes, "SEED_SUMMIT_CODES", timeout_sec=15)
 
+        # Bootstrap admin + core agents for empty environments.
+        def _do_bootstrap_system():
+            from .db import SessionLocal  # type: ignore
+            if SessionLocal is None:
+                return
+            db = SessionLocal()
+            try:
+                bootstrap_system(db, org=default_tenant() or "patroai")
+            finally:
+                db.close()
+        _run_with_timeout(_do_bootstrap_system, "BOOTSTRAP_SYSTEM", timeout_sec=15)
+
     # ADMIN_API_KEY is optional. If not set, admin access is granted only via admin-role JWT.
     # (ADMIN_EMAILS controls who becomes admin on register/login.)
     return None
-
 
 @app.get("/")
 def root():
@@ -1724,6 +1808,16 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     org = (get_org(x_org_slug) if x_org_slug else (inp.tenant or default_tenant())).strip()
     email = inp.email.lower().strip()
 
+    # Auto-admin resolution must happen before Summit access-code validation.
+    is_admin_email = email in admin_emails()
+    if not is_admin_email:
+        existing_admin = db.execute(
+            select(User.id).where(User.org_slug == org, User.role == "admin")
+        ).first()
+        if not existing_admin:
+            is_admin_email = True
+    role = "admin" if is_admin_email else "user"
+
     # PATCH0100_28: Rate limit registration
     if not _rate_limit_check(_rl_register_lock, _rl_register_calls, ip, _REGISTER_MAX_PER_MINUTE):
         raise HTTPException(status_code=429, detail="Muitas tentativas de registro. Aguarde 1 minuto.")
@@ -1737,8 +1831,8 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     # PATCH0100_28: Access code validation (Summit mode)
     signup_code_label = None
     signup_source = None
-    usage_tier = "summit_standard"
-    if SUMMIT_MODE:
+    usage_tier = "summit_vip" if is_admin_email else "summit_standard"
+    if SUMMIT_MODE and not is_admin_email:
         if not inp.access_code:
             logger.warning("REGISTER_DENIED reason=missing_code ip=%s org=%s", ip, org)
             raise HTTPException(status_code=403, detail="Código de acesso obrigatório no modo Summit.")
@@ -1751,9 +1845,12 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
         # Summit registration window enforcement
         if now_ts() > int(SUMMIT_EXPIRES_AT):
             raise HTTPException(status_code=403, detail="Período de acesso ao Summit encerrado.")
-        # VIP rules: invite code (efata777 / source=invite) grants VIP; pitch code remains standard
-        if (sc.source or "").strip().lower() == "investor" or (sc.label or "").lower() == "efata777":
+        # Explicit Summit source -> tier mapping
+        source_key = (sc.source or "").strip().lower()
+        if source_key == "investor":
             usage_tier = "summit_vip"
+        elif source_key == "summit_user":
+            usage_tier = "summit_standard"
 
     elif inp.access_code:
         # Non-summit mode but code provided — validate if exists
@@ -1767,10 +1864,6 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
         logger.warning("REGISTER_DENIED reason=terms_not_accepted ip=%s org=%s", ip, org)
         raise HTTPException(status_code=400, detail="Você precisa aceitar os Termos de Uso para continuar.")
 
-    # auto-admin
-    is_admin_email = email in admin_emails()
-    role = "admin" if is_admin_email else "user"
-
     existing = db.execute(select(User).where(User.org_slug == org, User.email == email)).scalar_one_or_none()
     if existing:
         raise HTTPException(status_code=409, detail="Email already registered")
@@ -1780,7 +1873,7 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
     u = User(
         id=new_id(), org_slug=org, email=email, name=inp.name.strip(),
         role=role, salt=salt, pw_hash=pw_hash, created_at=now_ts(),
-        approved_at=(now_ts() if is_admin_email else None),
+        approved_at=(now_ts() if role == "admin" else None),
         signup_code_label=signup_code_label, signup_source=signup_source,
         usage_tier=usage_tier,
         terms_accepted_at=(now_ts() if inp.accept_terms else None),
@@ -1825,12 +1918,12 @@ def register(inp: RegisterIn, request: Request = None, x_org_slug: Optional[str]
             db.commit()
     except Exception:
         logger.exception("ADMIN_SYNC_FAILED login_verify_otp user_id=%s", getattr(u, "id", None))
-    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier})
+    token = mint_token({"sub": u.id, "org": org, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": getattr(u, "usage_tier", usage_tier)})
 
     # Create user session for presence tracking
     _create_user_session(db, u.id, org, ip, signup_code_label, usage_tier)
 
-    return {"access_token": token, "token_type": "bearer", "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": usage_tier}}
+    return {"access_token": token, "token_type": "bearer", "user": {"id": u.id, "email": u.email, "name": u.name, "role": u.role, "approved_at": getattr(u, "approved_at", None), "usage_tier": getattr(u, "usage_tier", usage_tier)}}
 
 @app.post("/api/auth/login")
 def login(inp: LoginIn, x_org_slug: Optional[str] = Header(default=None), db: Session = Depends(get_db), request: Request = None):
